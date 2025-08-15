@@ -1,9 +1,13 @@
 import { registerOTel } from "@vercel/otel";
 import { TraceIdRatioBasedSampler } from "@opentelemetry/sdk-trace-base";
+import { PrismaInstrumentation } from '@prisma/instrumentation'
 
 export function register() {
   registerOTel({
     serviceName: "gumboard",
+    instrumentations: [
+      new PrismaInstrumentation()
+    ],
 
     traceSampler:
       process.env.NODE_ENV === "production" ? new TraceIdRatioBasedSampler(0.1) : "always_on",
