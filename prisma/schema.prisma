@@ -78,8 +78,25 @@ model Organization {
   invites   OrganizationInvite[]
   boards    Board[]
   selfServeInvites OrganizationSelfServeInvite[]
+  
+  stripeCustomerId       String?   @unique
+  stripeSubscriptionId   String?   @unique
+  stripeCurrentPeriodEnd DateTime?
+  subscriptionStatus     SubscriptionStatus @default(INACTIVE)
+  
+  planId    String?
+  plan      Plan?    @relation(fields: [planId], references: [id])
 
   @@map("organizations")
+}
+
+model Plan {
+  id              String   @id @default(cuid())
+  name            String   @unique
+  stripePriceId   String   @unique
+  organizations   Organization[]
+
+  @@map("plans")
 }
 
 model Board {
@@ -172,6 +189,17 @@ enum InviteStatus {
   PENDING
   ACCEPTED
   DECLINED
+}
+
+enum SubscriptionStatus {
+  INACTIVE
+  ACTIVE
+  CANCELED
+  PAST_DUE
+  UNPAID
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  TRIALING
 }
 
 model VerificationToken {

@@ -19,6 +19,10 @@ const schema = z.object({
   // NextAuth
   AUTH_URL: z.string().optional(),
   AUTH_SECRET: z.string(),
+
+  // Stripe
+  STRIPE_SECRET_KEY: z.string(),
+  STRIPE_WEBHOOK_SECRET: z.string(),
 });
 
 export const env = schema.parse(process.env);
