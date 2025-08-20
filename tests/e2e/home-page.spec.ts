@@ -288,15 +288,14 @@ test.describe("Home Page", () => {
     await expect(authenticatedPage.getByText("Split this")).toBeVisible();
     await expect(authenticatedPage.getByText("item here")).toBeVisible();
 
-    // Test 8: Should re-order items
+    // Test 8: Should re-order items using Playwright's dragTo()
     const sourceElementText = testContext.prefix("Metabase queries");
     const targetElementText = testContext.prefix("Review support huddle");
-    const sourceElement = authenticatedPage.locator(`text=${sourceElementText}`);
-    const targetElement = authenticatedPage.locator(`text=${targetElementText}`);
 
     const sourceTestId = testContext.prefix("301");
     const targetTestId = testContext.prefix("302");
 
+    // Verify initial order
     await expect(authenticatedPage.getByTestId(sourceTestId)).toHaveAttribute(
       "data-testorder",
       "0"
@@ -306,28 +305,33 @@ test.describe("Home Page", () => {
       "1"
     );
 
+    // Use test IDs for reliable element selection
+    const sourceElement = authenticatedPage.getByTestId(sourceTestId);
+    const targetElement = authenticatedPage.getByTestId(targetTestId);
+
     await expect(sourceElement).toBeVisible();
+    await expect(targetElement).toBeVisible();
 
-    const targetBox = await targetElement.boundingBox();
-    if (!targetBox) throw Error("Target element not found");
-
+    // Set up response listener
     const reorderResponse = authenticatedPage.waitForResponse(
       (resp) =>
         resp.url().includes(`/api/boards/${demoBoard.id}/notes/`) &&
         resp.request().method() === "PUT" &&
         resp.ok()
     );
-    await sourceElement.hover();
-    // Nudge cursor to satisfy dnd-kit activationConstraint
-    const sourceBox = await sourceElement.boundingBox();
-    if (!sourceBox) throw Error("Source element not found");
-    await authenticatedPage.mouse.move(sourceBox.x + sourceBox.width / 2, sourceBox.y + sourceBox.height / 2);
-    await authenticatedPage.mouse.down();
-    await authenticatedPage.mouse.move(sourceBox.x + sourceBox.width / 2, sourceBox.y + sourceBox.height / 2 + 10);
-    await authenticatedPage.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + 5);
-    await authenticatedPage.mouse.up();
+
+    await sourceElement.dragTo(targetElement, {
+      targetPosition: { x: 0, y: 50 },
+      force: true
+    });
+
+    // Wait for the response
     await reorderResponse;
 
+    // Wait for DOM to update
+    await authenticatedPage.waitForTimeout(500);
+
+    // Verify UI has updated - items should have swapped
     await expect(authenticatedPage.getByTestId(targetTestId)).toHaveAttribute(
       "data-testorder",
       "0"

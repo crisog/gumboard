@@ -162,7 +162,7 @@ test.describe("Archive Functionality", () => {
     });
 
     // Create an archived note inside the archived board
-    const note = await testPrisma.note.create({
+    await testPrisma.note.create({
       data: {
         color: "#fef3c7",
         archivedAt: new Date(),
