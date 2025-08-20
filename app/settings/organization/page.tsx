@@ -263,8 +263,8 @@ export default function OrganizationSettingsPage() {
     try {
       // Get the team plan from the API
       const plansResponse = await fetch("/api/plans");
-      const plans = await plansResponse.json();
-      const teamPlan = plans.find((p: any) => p.name.toLowerCase() === "team");
+      const plans: Array<{ id: string; name: string; stripePriceId: string }> = await plansResponse.json();
+      const teamPlan = plans.find((p) => p.name.toLowerCase() === "team");
       
       if (!teamPlan) {
         setErrorDialog({

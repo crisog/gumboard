@@ -52,7 +52,7 @@ export async function createCheckoutSession(
 export async function createPortalSession(customerId: string, returnUrl?: string) {
   const session = await stripe.billingPortal.sessions.create({
     customer: customerId,
-    return_url: returnUrl || getStripeUrl("/dashboard/organization"),
+    return_url: returnUrl || getStripeUrl("/settings/organization"),
   });
 
   return session;
