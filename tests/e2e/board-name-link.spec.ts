@@ -119,19 +119,24 @@ test.describe("Board Name Link Functionality", () => {
       authenticatedPage.locator(`text=${testContext.prefix("Note from Board 1")}`)
     ).toBeVisible();
 
-    // Find the board name link and click it
-    const boardLink = authenticatedPage.locator(`a[href="/boards/${board1.id}"]`).first();
+    const boardLink = authenticatedPage
+      .locator('[data-testid="note-card"]')
+      .filter({ hasText: testContext.prefix("Note from Board 1") })
+      .locator(`a[href="/boards/${board1.id}"]`);
+    
     await expect(boardLink).toBeVisible();
-
-    await Promise.race([
-      boardLink.click().then(() => authenticatedPage.waitForURL(`/boards/${board1.id}`)),
-      authenticatedPage.waitForTimeout(15000).then(() => {
-        throw new Error("Navigation timeout - link may not be working properly");
-      }),
-    ]);
-
-    // Verify we're on the correct page
-    await expect(authenticatedPage).toHaveURL(`/boards/${board1.id}`);
+    await expect(boardLink).toBeEnabled();
+    
+    await authenticatedPage.waitForTimeout(500);
+    
+    await boardLink.click();
+    
+    await authenticatedPage.waitForURL(`/boards/${board1.id}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 10000
+    });
+    
+    expect(authenticatedPage.url()).toContain(`/boards/${board1.id}`);
   });
 
   test("should maintain styling for board name links", async ({

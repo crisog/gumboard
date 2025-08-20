@@ -971,7 +971,9 @@ test.describe("Note Management", () => {
 
       // End date
       await authenticatedPage.getByRole("button", { name: "Pick an end date" }).click();
-      await authenticatedPage.getByRole("gridcell", { name: String(today.getDate()) }).click();
+      await authenticatedPage
+        .locator(`[data-day="${today.toISOString().split('T')[0]}"]`)
+        .click();
 
       await authenticatedPage.getByRole("button", { name: "Apply" }).click();
       await expect(authenticatedPage.locator('[data-testid="note-card"]')).toHaveCount(3);

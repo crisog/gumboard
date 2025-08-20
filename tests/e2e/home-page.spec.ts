@@ -161,23 +161,32 @@ test.describe("Home Page", () => {
     // Test 4: Edit existing checklist item content
     const originalFinanceText = testContext.prefix("Finance update by Friday");
     const updatedFinanceText = testContext.prefix("Updated Finance deadline");
+
     await authenticatedPage.getByText(originalFinanceText).click();
-    const editInput = authenticatedPage.locator("textarea").first();
+
+    const editInput = authenticatedPage
+      .getByTestId(testContext.prefix("101"))
+      .locator("textarea");
+
     await expect(editInput).toBeVisible();
+
     const editResponse = authenticatedPage.waitForResponse(
       (resp) =>
         resp.url().includes(`/api/boards/${demoBoard.id}/notes/`) &&
         resp.request().method() === "PUT" &&
         resp.ok()
     );
+
+    await editInput.clear();
     await editInput.fill(updatedFinanceText);
-    await editInput.blur(); // Use blur instead of Enter to save the edit
+
+    await authenticatedPage.locator('body').click();
+
     await editResponse;
     await expect(authenticatedPage.getByText(updatedFinanceText)).toBeVisible();
 
-    // Verify edit was saved to database
     const editedItem = await testPrisma.checklistItem.findFirst({
-      where: { content: updatedFinanceText },
+      where: { id: testContext.prefix("101") },
     });
     expect(editedItem).toBeTruthy();
     expect(editedItem?.content).toBe(updatedFinanceText);
@@ -301,9 +310,12 @@ test.describe("Home Page", () => {
         resp.ok()
     );
     await sourceElement.hover();
+    // Nudge cursor to satisfy dnd-kit activationConstraint
+    const sourceBox = await sourceElement.boundingBox();
+    if (!sourceBox) throw Error("Source element not found");
+    await authenticatedPage.mouse.move(sourceBox.x + sourceBox.width / 2, sourceBox.y + sourceBox.height / 2);
     await authenticatedPage.mouse.down();
-    await targetElement.hover();
-    await targetElement.hover();
+    await authenticatedPage.mouse.move(sourceBox.x + sourceBox.width / 2, sourceBox.y + sourceBox.height / 2 + 10);
     await authenticatedPage.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + 5);
     await authenticatedPage.mouse.up();
     await reorderResponse;
