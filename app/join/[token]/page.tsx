@@ -6,6 +6,10 @@ import { db } from "@/lib/db";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import Link from "next/link";
+import { FREE_PLAN_MEMBER_LIMIT } from "@/lib/constants";
+import { z } from "zod";
+
+const emailSchema = z.string().email("Invalid email address").min(1, "Email is required");
 
 async function joinOrganization(token: string) {
   "use server";
@@ -15,56 +19,89 @@ async function joinOrganization(token: string) {
     throw new Error("Not authenticated");
   }
 
-  // Find the self-serve invite by token
-  const invite = await db.organizationSelfServeInvite.findUnique({
-    where: { token: token },
-    include: { organization: true },
-  });
+  const userId = session.user.id;
 
-  if (!invite) {
-    throw new Error("Invalid or expired invitation link");
-  }
+  // Use transaction to prevent race conditions
+  await db.$transaction(async (tx) => {
+    // Find and validate the self-serve invite
+    const invite = await tx.organizationSelfServeInvite.findUnique({
+      where: { token: token },
+      include: { 
+        organization: {
+          include: {
+            plan: true,
+            members: true,
+            invites: {
+              where: { status: "PENDING" }
+            }
+          }
+        }
+      },
+    });
 
-  if (!invite.isActive) {
-    throw new Error("This invitation link has been deactivated");
-  }
+    if (!invite) {
+      throw new Error("Invalid or expired invitation link");
+    }
 
-  // Check if invite has expired
-  if (invite.expiresAt && invite.expiresAt < new Date()) {
-    throw new Error("This invitation link has expired");
-  }
+    if (!invite.isActive) {
+      throw new Error("This invitation link has been deactivated");
+    }
 
-  // Check if usage limit has been reached
-  if (invite.usageLimit && invite.usageCount >= invite.usageLimit) {
-    throw new Error("This invitation link has reached its usage limit");
-  }
+    // Check if invite has expired
+    if (invite.expiresAt && invite.expiresAt < new Date()) {
+      throw new Error("This invitation link has expired");
+    }
 
-  // Check if user is already in an organization
-  const user = await db.user.findUnique({
-    where: { id: session.user.id },
-    include: { organization: true },
-  });
+    // Check if usage limit has been reached (with fresh data)
+    if (invite.usageLimit && invite.usageCount >= invite.usageLimit) {
+      throw new Error("This invitation link has reached its usage limit");
+    }
 
-  if (user?.organizationId === invite.organizationId) {
-    throw new Error("You are already a member of this organization");
-  }
+    // Check member limits for free plan (null planId = free tier)
+    if (!invite.organization.plan) {
+      
+      const activeMembers = invite.organization.members.length;
+      const pendingInvites = invite.organization.invites.length;
+      const totalAfterJoin = activeMembers + pendingInvites + 1;
 
-  if (user?.organizationId) {
-    throw new Error(
-      "You are already a member of another organization. Please leave your current organization first."
-    );
-  }
+      if (totalAfterJoin > FREE_PLAN_MEMBER_LIMIT) {
+        throw new Error(`Free plan is limited to ${FREE_PLAN_MEMBER_LIMIT} members total (${activeMembers} current + ${pendingInvites} pending). Upgrade to Team plan for unlimited members.`);
+      }
+    }
 
-  // Join the organization
-  await db.user.update({
-    where: { id: session.user.id },
-    data: { organizationId: invite.organizationId },
-  });
+    // Check if user is already in an organization
+    const user = await tx.user.findUnique({
+      where: { id: userId },
+      include: { organization: true },
+    });
 
-  // Increment usage count
-  await db.organizationSelfServeInvite.update({
-    where: { token: token },
-    data: { usageCount: { increment: 1 } },
+    if (user?.organizationId === invite.organizationId) {
+      throw new Error("You are already a member of this organization");
+    }
+
+    if (user?.organizationId) {
+      throw new Error(
+        "You are already a member of another organization. Please leave your current organization first."
+      );
+    }
+
+    // Atomic join: update user and increment usage count
+    // This prevents the usage limit from being exceeded
+    const updatedInvite = await tx.organizationSelfServeInvite.update({
+      where: { token: token },
+      data: { usageCount: { increment: 1 } },
+    });
+
+    // Double-check usage limit after increment (defensive programming)
+    if (updatedInvite.usageLimit && updatedInvite.usageCount > updatedInvite.usageLimit) {
+      throw new Error("This invitation link has reached its usage limit");
+    }
+
+    // Join the organization
+    await tx.user.update({
+      where: { id: userId },
+      data: { organizationId: invite.organizationId },
+    });
   });
 
   redirect("/dashboard");
@@ -74,81 +111,125 @@ async function autoCreateAccountAndJoin(token: string, formData: FormData) {
   "use server";
 
   const email = formData.get("email")?.toString();
-  if (!email) {
-    throw new Error("Email is required");
+  
+  const validationResult = emailSchema.safeParse(email);
+  if (!validationResult.success) {
+    throw new Error(validationResult.error.issues[0].message);
   }
 
+  const cleanEmail = validationResult.data.trim().toLowerCase();
+
   try {
-    // Find the self-serve invite by token
-    const invite = await db.organizationSelfServeInvite.findUnique({
-      where: { token: token },
-      include: { organization: true },
-    });
-
-    if (!invite || !invite.isActive) {
-      throw new Error("Invalid or inactive invitation link");
-    }
-
-    // Check if invite has expired
-    if (invite.expiresAt && invite.expiresAt < new Date()) {
-      throw new Error("This invitation link has expired");
-    }
-
-    // Check if usage limit has been reached
-    if (invite.usageLimit && invite.usageCount >= invite.usageLimit) {
-      throw new Error("This invitation link has reached its usage limit");
-    }
-
-    // Check if user already exists
-    let user = await db.user.findUnique({
-      where: { email },
-    });
-
-    // If user doesn't exist, create one with verified email and auto-join organization
-    if (!user) {
-      user = await db.user.create({
-        data: {
-          email,
-          emailVerified: new Date(), // Auto-verify since they clicked the invite link
-          organizationId: invite.organizationId, // Auto-join the organization
+    // Use transaction to prevent race conditions
+    const result = await db.$transaction(async (tx) => {
+      // Find and validate the self-serve invite
+      const invite = await tx.organizationSelfServeInvite.findUnique({
+        where: { token: token },
+        include: { 
+          organization: {
+            include: {
+              plan: true,
+              members: true,
+              invites: {
+                where: { status: "PENDING" }
+              }
+            }
+          }
         },
       });
-    } else if (!user.organizationId) {
-      // If user exists but isn't in an organization, add them to this one
-      user = await db.user.update({
-        where: { id: user.id },
-        data: { organizationId: invite.organizationId },
-      });
-    } else if (user.organizationId === invite.organizationId) {
-      // User is already in this organization, just continue
-    } else {
-      throw new Error("You are already a member of another organization");
-    }
 
-    // Verify email if not already verified
-    if (!user.emailVerified) {
-      await db.user.update({
-        where: { id: user.id },
-        data: { emailVerified: new Date() },
-      });
-    }
+      if (!invite || !invite.isActive) {
+        throw new Error("Invalid or inactive invitation link");
+      }
 
-    // Increment usage count only if this is a new join
-    if (user.organizationId === invite.organizationId) {
-      await db.organizationSelfServeInvite.update({
-        where: { token: token },
-        data: { usageCount: { increment: 1 } },
-      });
-    }
+      // Check if invite has expired
+      if (invite.expiresAt && invite.expiresAt < new Date()) {
+        throw new Error("This invitation link has expired");
+      }
 
-    // Create a session for the user
+      // Check if usage limit has been reached (with fresh data)
+      if (invite.usageLimit && invite.usageCount >= invite.usageLimit) {
+        throw new Error("This invitation link has reached its usage limit");
+      }
+
+      // Check member limits for free plan (null planId = free tier)
+      if (!invite.organization.plan) {
+        
+        const activeMembers = invite.organization.members.length;
+        const pendingInvites = invite.organization.invites.length;
+        const totalAfterJoin = activeMembers + pendingInvites + 1;
+
+        if (totalAfterJoin > FREE_PLAN_MEMBER_LIMIT) {
+          throw new Error(`Free plan is limited to ${FREE_PLAN_MEMBER_LIMIT} members total (${activeMembers} current + ${pendingInvites} pending). Upgrade to Team plan for unlimited members.`);
+        }
+      }
+
+      // Check if user already exists
+      let user = await tx.user.findUnique({
+        where: { email: cleanEmail },
+      });
+
+      let isNewJoin = false;
+
+      if (!user) {
+        // Increment usage count first to reserve a spot
+        const updatedInvite = await tx.organizationSelfServeInvite.update({
+          where: { token: token },
+          data: { usageCount: { increment: 1 } },
+        });
+
+        // Double-check usage limit after increment
+        if (updatedInvite.usageLimit && updatedInvite.usageCount > updatedInvite.usageLimit) {
+          throw new Error("This invitation link has reached its usage limit");
+        }
+
+        // Create user with verified email and auto-join organization
+        user = await tx.user.create({
+          data: {
+            email: cleanEmail,
+            emailVerified: new Date(), // Auto-verify since they clicked the invite link
+            organizationId: invite.organizationId, // Auto-join the organization
+          },
+        });
+        isNewJoin = true;
+      } else if (!user.organizationId) {
+        // Increment usage count first to reserve a spot
+        const updatedInvite = await tx.organizationSelfServeInvite.update({
+          where: { token: token },
+          data: { usageCount: { increment: 1 } },
+        });
+
+        // Double-check usage limit after increment
+        if (updatedInvite.usageLimit && updatedInvite.usageCount > updatedInvite.usageLimit) {
+          throw new Error("This invitation link has reached its usage limit");
+        }
+
+        // User exists but isn't in an organization, add them to this one
+        user = await tx.user.update({
+          where: { id: user.id },
+          data: { 
+            organizationId: invite.organizationId,
+            emailVerified: user.emailVerified || new Date() // Verify if not already verified
+          },
+        });
+        isNewJoin = true;
+      } else if (user.organizationId === invite.organizationId) {
+        // User is already in this organization, just continue (no usage increment)
+      } else {
+        throw new Error("You are already a member of another organization");
+      }
+
+      return { user, isNewJoin };
+    });
+
+    // Create a session for the user (outside transaction to avoid long locks)
     const sessionToken = crypto.randomUUID();
     const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
 
     await db.session.create({
       data: {
         sessionToken,
-        userId: user.id,
+        userId: result.user.id,
         expires,
       },
     });
@@ -161,7 +242,7 @@ async function autoCreateAccountAndJoin(token: string, formData: FormData) {
     console.error("Auto-join error:", error);
     // Fallback to regular auth flow
     redirect(
-      `/auth/signin?email=${encodeURIComponent(email)}&callbackUrl=${encodeURIComponent(`/join/${token}`)}`
+      `/auth/signin?email=${encodeURIComponent(cleanEmail)}&callbackUrl=${encodeURIComponent(`/join/${token}`)}`
     );
   }
 }

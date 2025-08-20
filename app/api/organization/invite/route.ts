@@ -1,11 +1,14 @@
 import { auth } from "@/auth";
 import { db } from "@/lib/db";
-import { env } from "@/lib/env";
 import { NextRequest, NextResponse } from "next/server";
-import { Resend } from "resend";
 import { getBaseUrl } from "@/lib/utils";
+import { FREE_PLAN_MEMBER_LIMIT } from "@/lib/constants";
+import { sendInviteEmail } from "@/lib/email";
+import { z } from "zod";
 
-const resend = new Resend(env.AUTH_RESEND_KEY);
+const inviteRequestSchema = z.object({
+  email: z.string().email("Invalid email address").min(1, "Email is required"),
+});
 
 export async function POST(request: NextRequest) {
   try {
@@ -15,24 +18,44 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const { email } = await request.json();
+    const userId = session.user.id;
 
-    if (!email || typeof email !== "string") {
-      return NextResponse.json({ error: "Email is required" }, { status: 400 });
+    const body = await request.json();
+    const validationResult = inviteRequestSchema.safeParse(body);
+
+    if (!validationResult.success) {
+      return NextResponse.json(
+        { 
+          error: "Invalid request", 
+          details: validationResult.error.issues.map(issue => issue.message)
+        }, 
+        { status: 400 }
+      );
     }
 
+    const { email } = validationResult.data;
     const cleanEmail = email.trim().toLowerCase();
 
-    // Get user with organization
+    // Get user with organization and plan
     const user = await db.user.findUnique({
-      where: { id: session.user.id },
+      where: { id: userId },
       select: {
         id: true,
         name: true,
         email: true,
         isAdmin: true,
         organizationId: true,
-        organization: true,
+        organization: {
+          include: {
+            plan: true,
+            members: true,
+            invites: {
+              where: {
+                status: "PENDING"
+              }
+            }
+          }
+        },
       },
     });
 
@@ -45,76 +68,68 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Only admins can invite new members" }, { status: 403 });
     }
 
-    // Check if user is already in the organization
-    const existingUser = await db.user.findUnique({
-      where: { email: cleanEmail },
-    });
+    // Check member limits for free plan (null planId = free tier)
+    if (!user.organization.plan) {
+      const activeMembers = user.organization.members.length;
+      const pendingInvites = user.organization.invites.length;
+      const totalAfterInvite = activeMembers + pendingInvites + 1;
 
-    if (existingUser && existingUser.organizationId === user.organizationId) {
-      return NextResponse.json(
-        { error: "User is already a member of this organization" },
-        { status: 400 }
-      );
+      if (totalAfterInvite > FREE_PLAN_MEMBER_LIMIT) {
+        return NextResponse.json({
+          error: `Free plan is limited to ${FREE_PLAN_MEMBER_LIMIT} members total (${activeMembers} current + ${pendingInvites} pending). Upgrade to Team plan for unlimited members.`
+        }, { status: 400 });
+      }
     }
 
-    // Check if there's already a pending invite
-    const existingInvite = await db.organizationInvite.findUnique({
-      where: {
-        email_organizationId: {
-          email: cleanEmail,
-          organizationId: user.organizationId,
-        },
-      },
-    });
+    // Check for existing user or invite
+    const [existingUser, existingInvite] = await Promise.all([
+      db.user.findUnique({
+        where: { email: cleanEmail },
+        select: { organizationId: true }
+      }),
+      db.organizationInvite.findUnique({
+        where: {
+          email_organizationId: {
+            email: cleanEmail,
+            organizationId: user.organizationId!
+          }
+        }
+      })
+    ]);
 
-    if (existingInvite && existingInvite.status === "PENDING") {
+    if (existingUser?.organizationId === user.organizationId) {
+      return NextResponse.json({ error: "User is already a member of this organization" }, { status: 400 });
+    }
+
+    if (existingInvite?.status === "PENDING") {
       return NextResponse.json({ error: "Invite already sent to this email" }, { status: 400 });
     }
 
-    // Create or update the invite
+    // Create or update invite
     const invite = await db.organizationInvite.upsert({
       where: {
         email_organizationId: {
           email: cleanEmail,
-          organizationId: user.organizationId,
-        },
+          organizationId: user.organizationId!
+        }
       },
       update: {
         status: "PENDING",
-        createdAt: new Date(),
+        createdAt: new Date()
       },
       create: {
         email: cleanEmail,
-        organizationId: user.organizationId,
-        invitedBy: session.user.id,
-        status: "PENDING",
-      },
+        organizationId: user.organizationId!,
+        invitedBy: userId,
+        status: "PENDING"
+      }
     });
 
-    // Send invite email
+    // Send email
     try {
-      await resend.emails.send({
-        from: env.EMAIL_FROM,
-        to: cleanEmail,
-        subject: `${session.user.name} invited you to join ${user.organization.name}`,
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-            <h2>You're invited to join ${user.organization.name}!</h2>
-            <p>${session.user.name} (${session.user.email}) has invited you to join their organization on Gumboard.</p>
-            <p>Click the link below to accept the invitation:</p>
-            <a href="${getBaseUrl(request)}/invite/accept?token=${invite.id}" 
-               style="background-color: #007bff; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
-              Accept Invitation
-            </a>
-            <p style="margin-top: 20px; color: #666;">
-              If you don't want to receive these emails, please ignore this message.
-            </p>
-          </div>
-        `,
-      });
+      await sendInviteEmail(cleanEmail, user.organization.name, invite.id, getBaseUrl(request));
     } catch (emailError) {
-      console.error("Failed to send invite email:", emailError);
-      // Don't fail the entire request if email sending fails
+      console.error("Failed to send invitation email:", emailError);
     }
 
     return NextResponse.json({ invite }, { status: 201 });

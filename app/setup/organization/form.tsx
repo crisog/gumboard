@@ -7,15 +7,15 @@ import { Label } from "@/components/ui/label";
 import { X, Plus } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useUser } from "@/app/contexts/UserContext";
+import { createOrganization } from "./actions";
+import { Plan } from "@prisma/client";
 
 interface OrganizationSetupFormProps {
-  onSubmit: (
-    orgName: string,
-    teamEmails: string[]
-  ) => Promise<{ success: boolean; organization?: unknown }>;
+  maxMembers: number | null;
+  isTeamPlan?: boolean;
 }
 
-export default function OrganizationSetupForm({ onSubmit }: OrganizationSetupFormProps) {
+export default function OrganizationSetupForm({ maxMembers, isTeamPlan = false }: OrganizationSetupFormProps) {
   const [orgName, setOrgName] = useState("");
   const [teamEmails, setTeamEmails] = useState<string[]>([""]);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -23,6 +23,9 @@ export default function OrganizationSetupForm({ onSubmit }: OrganizationSetupFor
   const { refreshUser } = useUser();
 
   const addEmailField = () => {
+    if (maxMembers && teamEmails.length >= maxMembers) {
+      return;
+    }
     setTeamEmails([...teamEmails, ""]);
   };
 
@@ -49,13 +52,71 @@ export default function OrganizationSetupForm({ onSubmit }: OrganizationSetupFor
     setIsSubmitting(true);
     try {
       const validEmails = teamEmails.filter((email) => email.trim() && email.includes("@"));
-      const result = await onSubmit(orgName.trim(), validEmails);
+      
+      // Always create organization first (with free plan)
+      const result = await createOrganization(
+        orgName.trim(), 
+        validEmails,
+        isTeamPlan // Skip member limit for team plan
+      );
+      
       if (result?.success) {
         await refreshUser();
-        router.push("/dashboard");
+        
+        if (isTeamPlan) {
+          // For team plan, redirect to Stripe checkout after org creation
+          try {
+            // Get the team plan from database
+            const plansResponse = await fetch("/api/plans");
+            const plans: Plan[] = await plansResponse.json();
+            const teamPlan = plans.find((p) => p.name.toLowerCase() === "team");
+            
+            if (!teamPlan) {
+              console.error("Team plan not found");
+              setIsSubmitting(false);
+              return;
+            }
+
+            // Create Stripe checkout session
+            const checkoutResponse = await fetch("/api/stripe/checkout", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                planId: teamPlan.id,
+                teamEmails: JSON.stringify(validEmails),
+              }),
+            });
+
+            if (!checkoutResponse.ok) {
+              console.error("Checkout failed:", await checkoutResponse.text());
+              setIsSubmitting(false);
+              return;
+            }
+
+            const { url } = await checkoutResponse.json();
+            
+            if (url) {
+              // Redirect to Stripe Checkout
+              window.location.href = url;
+            } else {
+              console.error("No checkout URL received");
+              setIsSubmitting(false);
+            }
+          } catch (error) {
+            console.error("Error creating checkout session:", error);
+            setIsSubmitting(false);
+          }
+        } else {
+          // For free plan, go directly to dashboard
+          router.push("/dashboard");
+        }
+      } else {
+        setIsSubmitting(false);
       }
     } catch (error) {
-      console.error("Error creating organization:", error);
+      console.error("Error:", error);
       setIsSubmitting(false);
     }
   };
@@ -103,13 +164,31 @@ export default function OrganizationSetupForm({ onSubmit }: OrganizationSetupFor
           ))}
         </div>
 
-        <Button type="button" variant="outline" onClick={addEmailField} className="w-full">
+        <Button 
+          type="button" 
+          variant="outline" 
+          onClick={addEmailField} 
+          className="w-full"
+          disabled={maxMembers !== null && teamEmails.length >= maxMembers}
+        >
           <Plus className="h-4 w-4 mr-2" />
           Add Team Member
         </Button>
 
+        {maxMembers && !isTeamPlan && (
+          <p className="text-xs text-amber-600 dark:text-amber-400">
+            Free plan is limited to 3 members total (1 creator + 2 invites).
+          </p>
+        )}
+        
+        {isTeamPlan && (
+          <p className="text-xs text-blue-600 dark:text-blue-400">
+            Team plan includes unlimited members. You&apos;ll be redirected to payment after setup.
+          </p>
+        )}
+        
         <p className="text-xs text-muted-foreground">
-          {`we'll send invitations to join your organization to these email addresses.`}
+          {`We'll send invitations to join your organization to these email addresses.`}
         </p>
       </div>
 

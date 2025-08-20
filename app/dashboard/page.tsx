@@ -97,7 +97,7 @@ export default function Dashboard() {
           return;
         }
         if (!userData.organization) {
-          router.push("/setup/organization");
+          router.push("/setup/plans");
           return;
         }
       }

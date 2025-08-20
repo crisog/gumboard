@@ -89,6 +89,8 @@ export default function OrganizationSettingsPage() {
     variant?: "default" | "success" | "error";
   }>({ open: false, title: "", description: "", variant: "error" });
   const [creating, setCreating] = useState(false);
+  const [managingBilling, setManagingBilling] = useState(false);
+  const [upgrading, setUpgrading] = useState(false);
 
   useEffect(() => {
     if (user?.organization) {
@@ -223,6 +225,87 @@ export default function OrganizationSettingsPage() {
       });
     } finally {
       setInviting(false);
+    }
+  };
+
+  const handleManageBilling = async () => {
+    setManagingBilling(true);
+    try {
+      const response = await fetch("/api/stripe/portal", {
+        method: "POST",
+      });
+
+      if (response.ok) {
+        const { url } = await response.json();
+        window.location.href = url;
+      } else {
+        const errorData = await response.json();
+        setErrorDialog({
+          open: true,
+          title: "Failed to open billing portal",
+          description: errorData.error || "Failed to open billing portal",
+        });
+      }
+    } catch (error) {
+      console.error("Error opening billing portal:", error);
+      setErrorDialog({
+        open: true,
+        title: "Failed to open billing portal",
+        description: "Failed to open billing portal",
+      });
+    } finally {
+      setManagingBilling(false);
+    }
+  };
+
+  const handleUpgradeToTeam = async () => {
+    setUpgrading(true);
+    try {
+      // Get the team plan from the API
+      const plansResponse = await fetch("/api/plans");
+      const plans = await plansResponse.json();
+      const teamPlan = plans.find((p: any) => p.name.toLowerCase() === "team");
+      
+      if (!teamPlan) {
+        setErrorDialog({
+          open: true,
+          title: "Team plan not found",
+          description: "Unable to find the Team plan. Please contact support.",
+        });
+        return;
+      }
+
+      // Create checkout session using existing route
+      const response = await fetch("/api/stripe/checkout", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          planId: teamPlan.id,
+        }),
+      });
+
+      if (response.ok) {
+        const { url } = await response.json();
+        window.location.href = url;
+      } else {
+        const errorData = await response.json();
+        setErrorDialog({
+          open: true,
+          title: "Failed to start upgrade",
+          description: errorData.error || "Failed to start upgrade process",
+        });
+      }
+    } catch (error) {
+      console.error("Error starting upgrade:", error);
+      setErrorDialog({
+        open: true,
+        title: "Failed to start upgrade",
+        description: "Failed to start upgrade process",
+      });
+    } finally {
+      setUpgrading(false);
     }
   };
 
@@ -624,9 +707,17 @@ export default function OrganizationSettingsPage() {
             <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 mb-2">
               Invite Team Members
             </h3>
-            <p className="text-zinc-600 dark:text-zinc-400">
-              Send invitations to new team members.
-            </p>
+            <div className="space-y-1">
+              <p className="text-zinc-600 dark:text-zinc-400">
+                Send invitations to new team members.
+              </p>
+              {!user?.organization?.plan && (
+                <p className="text-sm text-amber-600 dark:text-amber-400">
+                  Free plan: {user?.organization?.members?.length || 0} of 3 members used
+                  {invites.length > 0 && ` (${invites.length} pending invites)`}
+                </p>
+              )}
+            </div>
           </div>
 
           <form onSubmit={handleInviteMember} className="flex space-x-4">
@@ -854,6 +945,71 @@ export default function OrganizationSettingsPage() {
               ))}
             </div>
           )}
+        </div>
+      </Card>
+
+      {/* Billing Section */}
+      <Card className="p-4 lg:p-6 bg-white dark:bg-black border border-gray-200 dark:border-zinc-800">
+        <div className="space-y-3 lg:space-y-6">
+          <div>
+            <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 mb-2">
+              Billing & Subscription
+            </h3>
+            <p className="text-zinc-600 dark:text-zinc-400">
+              Manage your organization&apos;s subscription and billing.
+            </p>
+          </div>
+
+          <div className="space-y-4">
+            {/* Current Plan - Simplified */}
+            <div className="p-4 bg-zinc-50 dark:bg-zinc-800 rounded-lg border border-zinc-200 dark:border-zinc-700">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h4 className="font-medium text-zinc-900 dark:text-zinc-100">
+                    {user?.organization?.plan?.name || "Free Plan"}
+                  </h4>
+                  <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                    {user?.organization?.members?.length || 0} team members
+                    {!user?.organization?.plan && " / 3"}
+                  </p>
+                </div>
+                <div className="text-right">
+                  <p className="font-medium text-zinc-900 dark:text-zinc-100">
+                    {user?.organization?.plan?.displayPrice || "Free"}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Actions */}
+            <div className="flex flex-col sm:flex-row gap-3">
+              {!user?.organization?.plan ? (
+                <Button
+                  onClick={handleUpgradeToTeam}
+                  disabled={upgrading || !user?.isAdmin}
+                  className="bg-blue-600 hover:bg-blue-700 dark:bg-blue-700 dark:hover:bg-blue-800 text-white disabled:bg-gray-400 disabled:cursor-not-allowed"
+                  title={!user?.isAdmin ? "Only admins can upgrade plans" : undefined}
+                >
+                  {upgrading ? "Starting upgrade..." : "Upgrade to Team Plan"}
+                </Button>
+              ) : (
+                <div className="space-y-3">
+                  <Button
+                    onClick={handleManageBilling}
+                    disabled={managingBilling || !user?.isAdmin}
+                    className="bg-blue-600 hover:bg-blue-700 dark:bg-blue-700 dark:hover:bg-blue-800 text-white"
+                    title={!user?.isAdmin ? "Only admins can manage billing" : undefined}
+                  >
+                    <ExternalLink className="w-4 h-4 mr-2" />
+                    {managingBilling ? "Opening Billing Portal..." : "Manage Subscription & Billing"}
+                  </Button>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                    Update payment methods, view invoices, change plans, or cancel subscription in the secure billing portal.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       </Card>
 

@@ -5,29 +5,37 @@ import { db } from "@/lib/db";
 import { stripe } from "@/lib/stripe";
 import { env } from "@/lib/env";
 import { SubscriptionStatus } from "@prisma/client";
-import type { Prisma } from "@prisma/client";
 import { z } from "zod";
 
+// Use invoice.payment_succeeded as single source of truth
 const relevantEvents = new Set([
-  "checkout.session.completed",
-  "customer.subscription.created",
-  "customer.subscription.updated",
-  "customer.subscription.deleted",
   "invoice.payment_succeeded",
-  "invoice.payment_failed",
+  "invoice.payment_failed", 
+  "customer.subscription.deleted",
+  "customer.subscription.updated",
 ]);
-
-const checkoutMetadataSchema = z.object({
-  organizationId: z.string().min(1, "Organization ID is required"),
-  userId: z.string().min(1, "User ID is required"),
-  planId: z.string().min(1, "Plan ID is required"),
-});
 
 const subscriptionMetadataSchema = z.object({
   organizationId: z.string().min(1, "Organization ID is required"),
   userId: z.string().optional(),
-  planId: z.string().optional(),
+  planId: z.string().min(1, "Plan ID is required"),
 });
+
+async function ensureIdempotency(eventId: string, eventType: string): Promise<boolean> {
+  try {
+    await db.stripeWebhookEvent.create({
+      data: {
+        stripeEventId: eventId,
+        eventType: eventType,
+        processed: true,
+      },
+    });
+    return true;
+  } catch {
+    console.log(`Event ${eventId} already processed, skipping`);
+    return false;
+  }
+}
 
 export async function POST(req: NextRequest) {
   const body = await req.text();
@@ -59,182 +67,35 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ received: true });
   }
 
+  // Ensure idempotency
+  const shouldProcess = await ensureIdempotency(event.id, event.type);
+  if (!shouldProcess) {
+    return NextResponse.json({ received: true });
+  }
+
   try {
     switch (event.type) {
-      case "checkout.session.completed": {
-        const session = event.data.object as Stripe.Checkout.Session;
-        
-        const metadataValidation = checkoutMetadataSchema.safeParse(session.metadata);
-        if (!metadataValidation.success) {
-          console.error("Invalid checkout session metadata:", metadataValidation.error.issues);
-          return NextResponse.json(
-            { error: "Invalid session metadata", details: metadataValidation.error.issues },
-            { status: 400 }
-          );
-        }
-
-        const { organizationId, planId } = metadataValidation.data;
-
-        const subscriptionId = session.subscription as string;
-        const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-
-        const subscriptionItem = subscription.items.data[0];
-        if (!subscriptionItem) {
-          console.error("No subscription items found");
-          return NextResponse.json(
-            { error: "No subscription items found" },
-            { status: 400 }
-          );
-        }
-
-        await db.organization.update({
-          where: { id: organizationId },
-          data: {
-            stripeCustomerId: subscription.customer as string,
-            stripeSubscriptionId: subscription.id,
-            stripeCurrentPeriodEnd: new Date(
-              subscriptionItem.current_period_end * 1000
-            ),
-            subscriptionStatus: mapStripeStatus(subscription.status),
-            planId: planId,
-          },
-        });
-        break;
-      }
-
-      case "customer.subscription.created":
-      case "customer.subscription.updated": {
-        const subscription = event.data.object as Stripe.Subscription;
-        
-        const metadataValidation = subscriptionMetadataSchema.safeParse(subscription.metadata);
-        if (!metadataValidation.success) {
-          console.error("Invalid subscription metadata:", metadataValidation.error.issues);
-          return NextResponse.json(
-            { error: "Invalid subscription metadata", details: metadataValidation.error.issues },
-            { status: 400 }
-          );
-        }
-
-        const { organizationId, planId } = metadataValidation.data;
-
-        // Get period information from the first subscription item
-        const subscriptionItem = subscription.items.data[0];
-        if (!subscriptionItem) {
-          console.error("No subscription items found");
-          return NextResponse.json(
-            { error: "No subscription items found" },
-            { status: 400 }
-          );
-        }
-
-        const updateData: Prisma.OrganizationUpdateInput = {
-          stripeSubscriptionId: subscription.id,
-          stripeCurrentPeriodEnd: new Date(
-            subscriptionItem.current_period_end * 1000
-          ),
-          subscriptionStatus: mapStripeStatus(subscription.status),
-          // Only update planId if it's provided (for new subscriptions or plan changes)
-          ...(planId && { planId }),
-        };
-
-        await db.organization.update({
-          where: { id: organizationId },
-          data: updateData,
-        });
-        break;
-      }
-
-      case "customer.subscription.deleted": {
-        const subscription = event.data.object as Stripe.Subscription;
-        
-        const organizationId = subscription.metadata?.organizationId;
-        if (!organizationId) {
-          console.error("No organizationId in subscription metadata");
-          return NextResponse.json(
-            { error: "Missing organizationId" },
-            { status: 400 }
-          );
-        }
-
-        await db.organization.update({
-          where: { id: organizationId },
-          data: {
-            stripeSubscriptionId: null,
-            stripeCurrentPeriodEnd: null,
-            subscriptionStatus: "INACTIVE",
-            planId: null,
-          },
-        });
-        break;
-      }
-
       case "invoice.payment_succeeded": {
         const invoice = event.data.object as Stripe.Invoice;
-        
-        // This handles successful subscription renewals
-        const subscriptionId = await getSubscriptionIdFromInvoice(invoice);
-        if (!subscriptionId) {
-          console.log("Invoice not associated with subscription, skipping");
-          break;
-        }
-        
-        if (invoice.billing_reason === "subscription_cycle") {
-          try {
-            const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-            const organizationId = subscription.metadata?.organizationId;
-            
-            if (organizationId) {
-              const subscriptionItem = subscription.items.data[0];
-              if (!subscriptionItem) {
-                console.error("No subscription items found for renewal");
-                break;
-              }
-
-              // Update the current period end for the organization
-              await db.organization.update({
-                where: { id: organizationId },
-                data: {
-                  stripeCurrentPeriodEnd: new Date(subscriptionItem.current_period_end * 1000),
-                  subscriptionStatus: "ACTIVE",
-                },
-              });
-              
-              console.log(`Subscription renewed for organization ${organizationId}`);
-            }
-          } catch (error) {
-            console.error("Error handling invoice payment:", error);
-          }
-        }
+        await handleInvoicePaymentSucceeded(invoice);
         break;
       }
 
       case "invoice.payment_failed": {
         const invoice = event.data.object as Stripe.Invoice;
-        
-        const subscriptionId = await getSubscriptionIdFromInvoice(invoice);
-        if (!subscriptionId) {
-          console.log("Failed invoice not associated with subscription, skipping");
-          break;
-        }
-        
-        try {
-          const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-          const organizationId = subscription.metadata?.organizationId;
-          
-          if (organizationId) {
-            // Update subscription status to reflect payment failure
-            await db.organization.update({
-              where: { id: organizationId },
-              data: {
-                subscriptionStatus: "PAST_DUE",
-              },
-            });
-            
-            console.log(`Payment failed for organization ${organizationId}`);
-          }
-        } catch (error) {
-          console.error("Error handling failed payment:", error);
-        }
+        await handleInvoicePaymentFailed(invoice);
+        break;
+      }
+
+      case "customer.subscription.deleted": {
+        const subscription = event.data.object as Stripe.Subscription;
+        await handleSubscriptionDeleted(subscription);
+        break;
+      }
+
+      case "customer.subscription.updated": {
+        const subscription = event.data.object as Stripe.Subscription;
+        await handleSubscriptionUpdated(subscription);
         break;
       }
 
@@ -245,6 +106,12 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ received: true });
   } catch (error) {
     console.error("Webhook handler error:", error);
+    // Remove the event record to allow retry
+    await db.stripeWebhookEvent.delete({
+      where: { stripeEventId: event.id },
+    }).catch(() => {
+      // Ignore deletion errors
+    });
     return NextResponse.json(
       { error: "Webhook handler failed" },
       { status: 500 }
@@ -252,16 +119,175 @@ export async function POST(req: NextRequest) {
   }
 }
 
+function getSubscriptionIdFromInvoice(invoice: Stripe.Invoice): string | null {
+  for (const lineItem of invoice.lines.data) {
+    if (lineItem.subscription) {
+      return typeof lineItem.subscription === 'string' 
+        ? lineItem.subscription 
+        : lineItem.subscription.id;
+    }
+  }
+  return null;
+}
+
+async function handleInvoicePaymentSucceeded(invoice: Stripe.Invoice) {
+  console.log(`Processing invoice payment succeeded: ${invoice.id}`);
+
+  const subscriptionId = getSubscriptionIdFromInvoice(invoice);
+  if (!subscriptionId) {
+    console.log("Invoice not associated with subscription, skipping");
+    return;
+  }
+
+  try {
+    const subscription = await stripe.subscriptions.retrieve(subscriptionId, {
+      expand: ['items.data.price.product']
+    });
+
+    const metadataValidation = subscriptionMetadataSchema.safeParse(subscription.metadata);
+    if (!metadataValidation.success) {
+      console.error("Invalid subscription metadata:", metadataValidation.error.issues);
+      throw new Error(`Invalid subscription metadata: ${metadataValidation.error.issues.map(i => i.message).join(', ')}`);
+    }
+
+    const { organizationId, planId } = metadataValidation.data;
+    
+    // Get subscription details
+    const subscriptionItem = subscription.items.data[0];
+    if (!subscriptionItem) {
+      throw new Error("No subscription items found");
+    }
+
+    // Defensive programming: Use upsert to handle race conditions
+    await db.organization.upsert({
+      where: { id: organizationId },
+      update: {
+        stripeCustomerId: subscription.customer as string,
+        stripeSubscriptionId: subscription.id,
+        stripeCurrentPeriodEnd: new Date(subscriptionItem.current_period_end * 1000),
+        subscriptionStatus: mapStripeStatus(subscription.status),
+        planId: planId,
+      },
+      create: {
+        id: organizationId,
+        name: "Organization", // Default name, should be updated elsewhere
+        stripeCustomerId: subscription.customer as string,
+        stripeSubscriptionId: subscription.id,
+        stripeCurrentPeriodEnd: new Date(subscriptionItem.current_period_end * 1000),
+        subscriptionStatus: mapStripeStatus(subscription.status),
+        planId: planId,
+      },
+    });
+
+    console.log(`Successfully processed payment for organization ${organizationId}`);
+  } catch (error) {
+    console.error("Error handling invoice payment succeeded:", error);
+    throw error;
+  }
+}
+
+async function handleInvoicePaymentFailed(invoice: Stripe.Invoice) {
+  console.log(`Processing invoice payment failed: ${invoice.id}`);
+
+  const subscriptionId = getSubscriptionIdFromInvoice(invoice);
+  if (!subscriptionId) {
+    console.log("Failed invoice not associated with subscription, skipping");
+    return;
+  }
+
+  try {
+    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+    const organizationId = subscription.metadata?.organizationId;
+
+    if (organizationId) {
+      await db.organization.update({
+        where: { id: organizationId },
+        data: {
+          subscriptionStatus: "PAST_DUE",
+        },
+      });
+
+      console.log(`Payment failed for organization ${organizationId}`);
+    }
+  } catch (error) {
+    console.error("Error handling failed payment:", error);
+    throw error;
+  }
+}
+
+async function handleSubscriptionDeleted(subscription: Stripe.Subscription) {
+  console.log(`Processing subscription deleted: ${subscription.id}`);
+
+  const organizationId = subscription.metadata?.organizationId;
+  if (!organizationId) {
+    console.error("No organizationId in subscription metadata");
+    throw new Error("Missing organizationId in subscription metadata");
+  }
+
+  try {
+    await db.organization.update({
+      where: { id: organizationId },
+      data: {
+        stripeSubscriptionId: null,
+        stripeCurrentPeriodEnd: null,
+        subscriptionStatus: "CANCELED",
+        planId: null,
+      },
+    });
+
+    console.log(`Subscription deleted for organization ${organizationId}`);
+  } catch (error) {
+    console.error("Error handling subscription deletion:", error);
+    throw error;
+  }
+}
+
+async function handleSubscriptionUpdated(subscription: Stripe.Subscription) {
+  console.log(`Processing subscription updated: ${subscription.id}`);
+
+  const metadataValidation = subscriptionMetadataSchema.safeParse(subscription.metadata);
+  if (!metadataValidation.success) {
+    console.error("Invalid subscription metadata:", metadataValidation.error.issues);
+    throw new Error(`Invalid subscription metadata: ${metadataValidation.error.issues.map(i => i.message).join(', ')}`);
+  }
+
+  const { organizationId, planId } = metadataValidation.data;
+  
+  try {
+    // Get subscription item details
+    const subscriptionItem = subscription.items.data[0];
+    if (!subscriptionItem) {
+      throw new Error("No subscription items found");
+    }
+
+    // Get the current period end from the subscription item
+    const currentPeriodEnd = subscriptionItem.current_period_end 
+      ? new Date(subscriptionItem.current_period_end * 1000) 
+      : null;
+
+    await db.organization.update({
+      where: { id: organizationId },
+      data: {
+        stripeSubscriptionId: subscription.id,
+        stripeCurrentPeriodEnd: currentPeriodEnd,
+        subscriptionStatus: mapStripeStatus(subscription.status),
+        planId: planId,
+      },
+    });
+
+    console.log(`Subscription updated for organization ${organizationId} - Status: ${subscription.status}, Plan: ${planId}`);
+  } catch (error) {
+    console.error("Error handling subscription update:", error);
+    throw error;
+  }
+}
+
 function mapStripeStatus(status: Stripe.Subscription.Status): SubscriptionStatus {
   switch (status) {
     case "active":
       return "ACTIVE";
-    case "canceled":
+    case "canceled": 
       return "CANCELED";
-    case "incomplete":
-      return "INCOMPLETE";
-    case "incomplete_expired":
-      return "INCOMPLETE_EXPIRED";
     case "past_due":
       return "PAST_DUE";
     case "trialing":
@@ -273,46 +299,3 @@ function mapStripeStatus(status: Stripe.Subscription.Status): SubscriptionStatus
   }
 }
 
-// Helper function to safely extract subscription ID from invoice
-async function getSubscriptionIdFromInvoice(invoice: Stripe.Invoice): Promise<string | null> {
-  // Check if this is a subscription invoice by looking at the line items
-  for (const lineItem of invoice.lines.data) {
-    if (lineItem.subscription) {
-      const subId = typeof lineItem.subscription === 'string' 
-        ? lineItem.subscription 
-        : lineItem.subscription.id;
-      return subId;
-    }
-  }
-
-  // For subscription creation invoices, find subscription by customer and billing reason
-  if (invoice.billing_reason === 'subscription_create' || invoice.billing_reason === 'subscription_cycle') {
-    const customerId = typeof invoice.customer === 'string' 
-      ? invoice.customer 
-      : invoice.customer?.id;
-      
-    if (!customerId) {
-      console.log('❌ No customer ID found in invoice');
-      return null;
-    }
-
-    try {
-      // Find active subscription for this customer
-      const subscriptions = await stripe.subscriptions.list({
-        customer: customerId,
-        status: 'all',
-        limit: 10
-      });
-
-      // Return the most recent subscription
-      if (subscriptions.data.length > 0) {
-        return subscriptions.data[0].id;
-      }
-    } catch (error) {
-      console.error('Error looking up subscription:', error);
-    }
-  }
-
-  console.log("❌ No subscription ID found in invoice");
-  return null;
-}

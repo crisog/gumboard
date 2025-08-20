@@ -93,7 +93,10 @@ model Organization {
 model Plan {
   id              String   @id @default(cuid())
   name            String   @unique
-  stripePriceId   String   @unique
+  stripePriceId   String   @unique // Required - all DB plans are paid plans
+  displayPrice    String?  // Human readable price like "$9/month" or "Free"
+  description     String?
+  features        String[]
   organizations   Organization[]
 
   @@map("plans")
@@ -200,6 +203,16 @@ enum SubscriptionStatus {
   INCOMPLETE
   INCOMPLETE_EXPIRED
   TRIALING
+}
+
+model StripeWebhookEvent {
+  id         String   @id @default(cuid())
+  stripeEventId String @unique
+  eventType  String
+  processed  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  
+  @@map("webhook_events")
 }
 
 model VerificationToken {

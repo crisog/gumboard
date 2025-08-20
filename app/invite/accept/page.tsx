@@ -12,6 +12,8 @@ async function acceptInvite(token: string) {
     throw new Error("Not authenticated");
   }
 
+  const userId = session.user.id;
+
   // Find the invite by token (ID)
   const invite = await db.organizationInvite.findUnique({
     where: { id: token },
@@ -30,16 +32,29 @@ async function acceptInvite(token: string) {
     throw new Error("This invitation has already been processed");
   }
 
-  // Update user to join the organization
-  await db.user.update({
-    where: { id: session.user.id },
-    data: { organizationId: invite.organizationId },
-  });
+  // Use transaction to prevent race conditions
+  await db.$transaction(async (tx) => {
+    // Check user's current organization within transaction
+    const currentUser = await tx.user.findUnique({
+      where: { id: userId },
+      select: { organizationId: true }
+    });
 
-  // Mark invite as accepted
-  await db.organizationInvite.update({
-    where: { id: token },
-    data: { status: "ACCEPTED" },
+    if (currentUser?.organizationId) {
+      throw new Error("You are already a member of an organization");
+    }
+
+    // Update user to join the organization
+    await tx.user.update({
+      where: { id: userId },
+      data: { organizationId: invite.organizationId },
+    });
+
+    // Mark invite as accepted
+    await tx.organizationInvite.update({
+      where: { id: token },
+      data: { status: "ACCEPTED" },
+    });
   });
 
   redirect("/dashboard");

@@ -4,7 +4,6 @@ import { env } from "@/lib/env";
 
 export const stripe = new Stripe(env.STRIPE_SECRET_KEY, {
   apiVersion: "2025-07-30.basil",
-  typescript: true,
 });
 
 export const getStripeUrl = (path: string = "") => {
@@ -17,7 +16,8 @@ export async function createCheckoutSession(
   organizationId: string, 
   userId: string,
   stripePriceId: string,
-  planId: string
+  planId: string,
+  teamEmails?: string
 ) {
   const session = await stripe.checkout.sessions.create({
     mode: "subscription",
@@ -30,12 +30,12 @@ export async function createCheckoutSession(
     ],
     success_url: getStripeUrl("/api/stripe/checkout-success?session_id={CHECKOUT_SESSION_ID}"),
     cancel_url: getStripeUrl("/dashboard?canceled=true"),
-    client_reference_id: userId, // Track which user initiated the checkout
-    allow_promotion_codes: true, // Enable discount codes
+    client_reference_id: userId,
     metadata: {
       organizationId,
       userId,
       planId,
+      ...(teamEmails && { teamEmails }),
     },
     subscription_data: {
       metadata: {

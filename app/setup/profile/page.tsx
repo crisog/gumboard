@@ -31,7 +31,7 @@ async function updateUserName(formData: FormData) {
   });
 
   if (!user?.organization) {
-    redirect("/setup/organization");
+    redirect("/setup/plans");
   } else {
     redirect("/dashboard");
   }
@@ -52,7 +52,7 @@ export default async function ProfileSetup() {
     });
 
     if (!user?.organization) {
-      redirect("/setup/organization");
+      redirect("/setup/plans");
     } else {
       redirect("/dashboard");
     }

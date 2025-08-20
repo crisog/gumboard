@@ -16,6 +16,14 @@ export async function GET() {
       include: {
         organization: {
           include: {
+            plan: {
+              select: {
+                id: true,
+                name: true,
+                displayPrice: true,
+                features: true,
+              },
+            },
             members: {
               select: {
                 id: true,
@@ -46,6 +54,7 @@ export async function GET() {
             name: user.organization.name,
             slackWebhookUrl: user.organization.slackWebhookUrl,
             members: user.organization.members,
+            plan: user.organization.plan,
           }
         : null,
     });

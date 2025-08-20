@@ -6,6 +6,7 @@ import { z } from "zod";
 
 const checkoutRequestSchema = z.object({
   planId: z.string().min(1, "Plan ID is required"),
+  teamEmails: z.string().optional(),
 });
 
 export async function POST(req: NextRequest) {
@@ -26,10 +27,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const { planId } = validationResult.data;
+    const { planId, teamEmails } = validationResult.data;
 
-    // SECURITY: Always fetch plan from database to ensure price integrity
-    // Never trust client-sent prices
     const plan = await db.plan.findUnique({
       where: { id: planId },
     });
@@ -38,7 +37,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Plan not found" }, { status: 404 });
     }
 
-    // Verify plan is valid for new subscriptions
     if (!plan.stripePriceId) {
       return NextResponse.json({ error: "Plan is not configured for payments" }, { status: 400 });
     }
@@ -64,9 +62,10 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (user.organization.stripeCustomerId) {
+    // Allow upgrade from free plan (no active subscription) to paid plan
+    if (user.organization.stripeCustomerId && user.organization.stripeSubscriptionId) {
       return NextResponse.json(
-        { error: "Organization already has an active subscription" },
+        { error: "Organization already has an active subscription. Use billing portal to change plans." },
         { status: 400 }
       );
     }
@@ -75,7 +74,8 @@ export async function POST(req: NextRequest) {
       user.organizationId,
       user.id,
       plan.stripePriceId,
-      plan.id
+      plan.id,
+      teamEmails
     );
 
     return NextResponse.json({ url: checkoutSession.url });
